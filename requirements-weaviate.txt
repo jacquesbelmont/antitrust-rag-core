@@ -1,0 +1,3 @@
+# Optional: install for Weaviate-backed vector store
+# Usage: pip install -r requirements.txt -r requirements-weaviate.txt
+weaviate-client==4.9.6

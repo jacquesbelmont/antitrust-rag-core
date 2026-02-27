@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  weaviate:
+    image: semitechnologies/weaviate:1.27.2
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: node1
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      RAG_VECTOR_STORE_BACKEND: weaviate
+      RAG_WEAVIATE_URL: http://weaviate:8080
+      RAG_USE_OLLAMA: "true"
+      # Ollama runs on the host machine (not in Docker) — use host gateway
+      RAG_OLLAMA_BASE_URL: http://host.docker.internal:11434
+      RAG_ENABLE_RERANKING: "true"
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  weaviate_data:
