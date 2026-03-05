@@ -1,11 +1,99 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Hierarchical Legal RAG — Production Docker Compose
+# Six fully-decoupled services: postgres, redis, weaviate, api, worker, flower
+# ──────────────────────────────────────────────────────────────────────────────
 version: "3.9"
 
+networks:
+  rag_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  weaviate_data:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable environment anchor — services that talk to all three datastores
+# ─────────────────────────────────────────────────────────────────────────────
+x-datastore-env: &datastore-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-legalrag}
+  POSTGRES_USER: ${POSTGRES_USER:-legalrag}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?err — set POSTGRES_PASSWORD in .env}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?err — set REDIS_PASSWORD in .env}
+  WEAVIATE_URL: http://weaviate:8080
+
+x-datastore-depends: &datastore-depends
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  weaviate:
+    condition: service_healthy
+
 services:
+
+  # ══ 1. PostgreSQL 16 ══════════════════════════════════════════════════════
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-legalrag}
+      POSTGRES_USER: ${POSTGRES_USER:-legalrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?err — set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    expose:
+      - "5432"   # internal only — never published to host
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U ${POSTGRES_USER:-legalrag} -d ${POSTGRES_DB:-legalrag}"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ══ 2. Redis 7 (message broker + Celery result backend) ══════════════════
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [rag_net]
+    # Password-protected, AOF persistence (appendfsync everysec = safe default)
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD:?err — set REDIS_PASSWORD in .env}
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"   # internal only
+    healthcheck:
+      test:
+        - "CMD"
+        - "redis-cli"
+        - "-a"
+        - "${REDIS_PASSWORD}"
+        - "ping"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ══ 3. Weaviate 1.27 (vector database — HNSW, cosine) ═══════════════════
   weaviate:
     image: semitechnologies/weaviate:1.27.2
-    ports:
-      - "8080:8080"
-      - "50051:50051"
+    restart: unless-stopped
+    networks: [rag_net]
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
@@ -15,27 +103,84 @@ services:
       CLUSTER_HOSTNAME: node1
     volumes:
       - weaviate_data:/var/lib/weaviate
+    expose:
+      - "8080"
+      - "50051"
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
+      test:
+        - "CMD"
+        - "wget"
+        - "--spider"
+        - "-q"
+        - "http://localhost:8080/v1/.well-known/ready"
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
 
+  # ══ 4. FastAPI — Synchronous REST API ════════════════════════════════════
+  #   • Handles: user queries, job status, document upload (enqueue only)
+  #   • Does NOT parse PDFs or run embeddings — delegates to worker
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+      target: runtime
+    restart: unless-stopped
+    networks: [rag_net]
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     environment:
-      RAG_VECTOR_STORE_BACKEND: weaviate
-      RAG_WEAVIATE_URL: http://weaviate:8080
-      RAG_USE_OLLAMA: "true"
-      # Ollama runs on the host machine (not in Docker) — use host gateway
-      RAG_OLLAMA_BASE_URL: http://host.docker.internal:11434
-      RAG_ENABLE_RERANKING: "true"
+      <<: *datastore-env
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_LLM_MODEL: ${OLLAMA_LLM_MODEL:-mistral}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      RAG_RETRIEVAL_TOP_K_DEFAULT: ${RAG_RETRIEVAL_TOP_K_DEFAULT:-5}
+      RAG_ENABLE_RERANKING: ${RAG_ENABLE_RERANKING:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      weaviate:
-        condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      <<: *datastore-depends
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-volumes:
-  weaviate_data:
+  # ══ 5. Celery — Asynchronous Ingestion Worker ════════════════════════════
+  #   • Consumes from Redis queue: "ingestion"
+  #   • Pipeline: receive task → parse PDF → chunk → embed → write to PG + Weaviate
+  #   • Completely stateless: scale with `docker compose up --scale worker=N`
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+      target: runtime
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      <<: *datastore-env
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      RAG_MAX_CHUNK_CHARS: ${RAG_MAX_CHUNK_CHARS:-1400}
+      RAG_CHUNK_OVERLAP_CHARS: ${RAG_CHUNK_OVERLAP_CHARS:-120}
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      <<: *datastore-depends
+
+  # ══ 6. Flower — Celery Task Monitoring UI ════════════════════════════════
+  #   • Protected by HTTP Basic Auth (FLOWER_USER / FLOWER_PASSWORD)
+  #   • Exposes real-time task status, retries, worker health
+  flower:
+    image: mher/flower:2.0
+    restart: unless-stopped
+    networks: [rag_net]
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    environment:
+      CELERY_BROKER_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      FLOWER_BASIC_AUTH: "${FLOWER_USER:-admin}:${FLOWER_PASSWORD:?err — set FLOWER_PASSWORD in .env}"
+    depends_on:
+      redis:
+        condition: service_healthy

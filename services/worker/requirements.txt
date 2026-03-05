@@ -1,0 +1,21 @@
+# ── Task queue ────────────────────────────────────────────────────────────────
+celery[redis]>=5.4.0
+redis>=5.0.0
+
+# ── Database (sync — psycopg2 is fork-safe for Celery prefork pool) ───────────
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+
+# ── Data validation ───────────────────────────────────────────────────────────
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# ── PDF parsing ───────────────────────────────────────────────────────────────
+# PyMuPDF ≥ 1.23 ships pre-compiled wheels — no system MuPDF required.
+pymupdf>=1.24.0
+
+# ── HTTP client (Ollama embedding calls) ─────────────────────────────────────
+httpx>=0.27.0
+
+# ── Vector store ──────────────────────────────────────────────────────────────
+weaviate-client>=4.6.0
